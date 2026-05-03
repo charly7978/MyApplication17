@@ -9,8 +9,7 @@ import kotlin.math.ln
 
 /**
  * Analizador de frames para extracción de señales PPG de grado clínico.
- * Implementa Zero-Allocation (cero recolección de basura por frame).
- * Extrae canales R, G, y B requeridos para el algoritmo POS y aproximación SpO2.
+ * Implementa Zero-Allocation y validación óptica de tejido estricta.
  */
 class PpgFrameAnalyzer(
     private val onSampleReady: (PpgSample) -> Unit
@@ -19,7 +18,6 @@ class PpgFrameAnalyzer(
     private var frameCount: Int = 0
     private var startTime: Long = 0
     
-    // Objeto pre-asignado para evitar Garbage Collection stutters
     private val reusableSample = PpgSample()
 
     @ExperimentalGetImage
@@ -38,10 +36,8 @@ class PpgFrameAnalyzer(
 
         processYuvImage(image, timestamp, fps)
 
-        // Quality Gate: Solo reportamos la muestra si pasa las métricas de contacto
-        if (reusableSample.rejectReason == null) {
-            onSampleReady(reusableSample)
-        }
+        // Enviamos siempre la muestra para que el procesador sepa si debe cortar la onda
+        onSampleReady(reusableSample)
 
         imageProxy.close()
     }
@@ -62,7 +58,7 @@ class PpgFrameAnalyzer(
         val uvRowStride = uPlane.rowStride
         val uvPixelStride = uPlane.pixelStride
 
-        // ROI Central aumentado (100x100) para mayor estabilidad de promediado espacial
+        // ROI Central 100x100
         val roiSize = 100.coerceAtMost(width / 2).coerceAtMost(height / 2)
         val startX = (width - roiSize) / 2
         val startY = (height - roiSize) / 2
@@ -70,8 +66,9 @@ class PpgFrameAnalyzer(
         var sumR = 0L
         var sumG = 0L
         var sumB = 0L
+        var sumR2 = 0L // Para varianza espacial
+        
         var validPixels = 0
-        var clippingHighCount = 0
         var clippingLowCount = 0
 
         for (y in startY until startY + roiSize) {
@@ -79,7 +76,6 @@ class PpgFrameAnalyzer(
                 val yIdx = y * yRowStride + x
                 val uvIdx = (y / 2) * uvRowStride + (x / 2) * uvPixelStride
 
-                // YUV420 a RGB (Integer math para performance)
                 val yVal = (yBuffer[yIdx].toInt() and 0xFF)
                 val uVal = (uBuffer[uvIdx].toInt() and 0xFF) - 128
                 val vVal = (vBuffer[uvIdx].toInt() and 0xFF) - 128
@@ -92,38 +88,41 @@ class PpgFrameAnalyzer(
                 if (g > 255) g = 255 else if (g < 0) g = 0
                 if (b > 255) b = 255 else if (b < 0) b = 0
 
-                if (r > 250 || g > 250 || b > 250) clippingHighCount++
-                if (yVal < 8) clippingLowCount++
+                if (yVal < 5) clippingLowCount++
 
-                // Criterio estricto de contacto: Señal PPG requiere predominancia ROJA fuerte (luz del flash a través de tejido)
-                if (r > g * 1.5f && r > b * 1.5f) {
-                    sumR += r
-                    sumG += g
-                    sumB += b
-                    validPixels++
-                }
+                // Un dedo sobre el flash es > 90% rojo puro. 
+                sumR += r
+                sumG += g
+                sumB += b
+                sumR2 += (r * r).toLong()
+                validPixels++
             }
         }
 
         val totalRoiPixels = roiSize * roiSize
-        val maskCoverage = validPixels.toFloat() / totalRoiPixels
-        val clippingHigh = clippingHighCount.toFloat() / totalRoiPixels
-        val clippingLow = clippingLowCount.toFloat() / totalRoiPixels
-
-        val contactScore = (maskCoverage * (1f - clippingHigh) * (1f - clippingLow)).coerceIn(0f, 1f)
-
-        // Si no hay suficiente cobertura de tejido, marcamos como inválido
-        if (validPixels < (totalRoiPixels * 0.2f)) {
-            reusableSample.rejectReason = "NO_FINGER"
-            return
-        }
-
+        
         val avgR = sumR.toFloat() / validPixels
         val avgG = sumG.toFloat() / validPixels
         val avgB = sumB.toFloat() / validPixels
+        
+        // Varianza espacial del rojo: Var(X) = E[X^2] - (E[X])^2
+        val avgR2 = sumR2.toFloat() / validPixels
+        val varianceR = avgR2 - (avgR * avgR)
+        
+        // COMPUERTA FORENSE ÓPTICA:
+        // 1. Rojo muy alto (saturación de flash por capilares)
+        // 2. Verde/Azul muy bajos (la sangre los absorbe masivamente)
+        // 3. Varianza extremadamente baja (difusión isotrópica del tejido celular, no hay textura)
+        val isFingerPresent = avgR > 180f && avgG < 120f && avgB < 120f && varianceR < 500f && (clippingLowCount.toFloat()/totalRoiPixels) < 0.5f
 
-        // Absorbancia relativa (Beer-Lambert: A = -ln(I/I0))
-        // Utilizamos el ln directo + epsilon para evitar infinito
+        val contactScore = if (isFingerPresent) 1.0f else 0.0f
+
+        if (!isFingerPresent) {
+            reusableSample.rejectReason = "NO_FINGER_DETECTED"
+            reusableSample.contactScore = 0f
+            return
+        }
+
         val ppgRed = -ln((avgR + 0.1f) / 256f)
         val ppgGreen = -ln((avgG + 0.1f) / 256f)
         val ppgBlue = -ln((avgB + 0.1f) / 256f)
@@ -137,12 +136,12 @@ class PpgFrameAnalyzer(
             ppgGreenAbsorbance = ppgGreen,
             ppgRedAbsorbance = ppgRed,
             ppgBlueAbsorbance = ppgBlue,
-            maskCoverage = maskCoverage,
+            maskCoverage = 1.0f,
             contactScore = contactScore,
-            clippingHigh = clippingHigh,
-            clippingLow = clippingLow,
-            motionOptical = 0f,
-            rejectReason = if (contactScore < 0.6f) "BAD_CONTACT" else null
+            clippingHigh = 0f,
+            clippingLow = clippingLowCount.toFloat() / totalRoiPixels,
+            motionOptical = varianceR, // Guardamos la varianza como referencia
+            rejectReason = null
         )
     }
 }

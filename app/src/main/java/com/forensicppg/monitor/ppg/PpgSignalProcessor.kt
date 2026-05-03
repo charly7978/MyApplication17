@@ -2,6 +2,7 @@ package com.forensicppg.monitor.ppg
 
 import com.forensicppg.monitor.domain.PpgSample
 import kotlin.math.sqrt
+import kotlin.math.abs
 
 /**
  * Procesador de señal PPG de grado clínico y forense.
@@ -36,13 +37,14 @@ class PpgSignalProcessor(
     private val bpmBuffer = FloatCircularBuffer(10)
     private val spo2Buffer = FloatCircularBuffer(30) // Promedio más largo para SpO2
     
-    // RMS tracking para SpO2
+    // RMS tracking para SpO2 y control de amplitud
     private var sumRedAcSq = 0f
     private var sumBlueAcSq = 0f
+    private var sumGreenAcSq = 0f
     private var rmsCount = 0
 
     fun process(sample: PpgSample) {
-        if (sample.rejectReason != null) {
+        if (sample.rejectReason != null || sample.contactScore < 0.5f) {
             reset()
             onBpmUpdate(null)
             onSpO2Update(null)
@@ -54,7 +56,6 @@ class PpgSignalProcessor(
             configureFilters(sample.effectiveFps)
         }
         
-        // Si no hay FPS válido aún, no filtramos pero reportamos cero para no corromper la onda
         if (!filtersConfigured) {
             onWaveformUpdate(0f)
             return
@@ -75,12 +76,11 @@ class PpgSignalProcessor(
         val velocity = cleanGreenAC - lastValue
         val acceleration = velocity - lastV
         lastV = velocity
-        // La aceleración (SDPPG) puede utilizarse para detectar rigidez arterial (ondas a, b, c, d, e)
         
         // 4. Detección de picos y BPM
         detectPeaks(cleanGreenAC, sample.timestamp)
         
-        // 5. Cálculo de SpO2
+        // 5. Cálculo de SpO2 y Compuerta de Amplitud Fisiológica
         val redDC = redDcFilter.process(rawRed)
         val blueDC = blueDcFilter.process(rawBlue)
         val redAC = redAcFilter.process(rawRed)
@@ -88,24 +88,34 @@ class PpgSignalProcessor(
         
         sumRedAcSq += redAC * redAC
         sumBlueAcSq += blueAC * blueAC
+        sumGreenAcSq += cleanGreenAC * cleanGreenAC
         rmsCount++
         
-        // Calculamos SpO2 cada 30 frames (aprox 0.5 seg)
-        if (rmsCount >= 30 && redDC > 0.001f && blueDC > 0.001f) {
+        // Evaluamos amplitud cada segundo aprox (60 frames)
+        if (rmsCount >= 60 && redDC > 0.001f && blueDC > 0.001f) {
             val rmsRedAc = sqrt(sumRedAcSq / rmsCount)
             val rmsBlueAc = sqrt(sumBlueAcSq / rmsCount)
+            val rmsGreenAc = sqrt(sumGreenAcSq / rmsCount)
             
+            // COMPUERTA FISIOLÓGICA: Si la amplitud es microscópica, es ruido de cámara amplificado.
+            // Si es gigantesca, es movimiento brutal.
+            if (rmsGreenAc < 0.0001f || rmsGreenAc > 0.1f) {
+                // FALSO POSITIVO DETECTADO: Cortar la señal.
+                reset()
+                onBpmUpdate(null)
+                onSpO2Update(null)
+                onWaveformUpdate(0f)
+                return
+            }
+
             // Ratio of Ratios (R) = (AC_red / DC_red) / (AC_blue / DC_blue)
             val ratio = (rmsRedAc / redDC) / (rmsBlueAc / blueDC)
             
-            // Fórmula forense estandarizada para cámaras sin IR (Aproximación empírica)
-            // Valores típicos: SpO2 = 110 - 25 * R
             val spo2Raw = 110f - 25f * ratio
             val spo2Clamped = spo2Raw.coerceIn(80f, 100f)
             
             spo2Buffer.push(spo2Clamped)
             
-            // Promedio del SpO2
             var sumSpo2 = 0f
             for (i in 0 until spo2Buffer.size) sumSpo2 += spo2Buffer.get(i)
             val avgSpo2 = sumSpo2 / spo2Buffer.size
@@ -114,6 +124,7 @@ class PpgSignalProcessor(
             
             sumRedAcSq = 0f
             sumBlueAcSq = 0f
+            sumGreenAcSq = 0f
             rmsCount = 0
         }
     }
@@ -121,15 +132,12 @@ class PpgSignalProcessor(
     private fun configureFilters(fps: Float) {
         val f = fps.coerceIn(15f, 120f)
         
-        // Banda de paso: 0.5Hz a 4.0Hz (30 BPM a 240 BPM)
         highPassFilter.configureHighpass(f, 0.5f)
         lowPassFilter.configureLowpass(f, 4.0f)
         
-        // DC Filters: Pasa bajos muy lentos (0.1Hz) para obtener la media de absorción
         redDcFilter.configureLowpass(f, 0.1f)
         blueDcFilter.configureLowpass(f, 0.1f)
         
-        // AC Filters: Pasa altos (0.5Hz)
         redAcFilter.configureHighpass(f, 0.5f)
         blueAcFilter.configureHighpass(f, 0.5f)
         
@@ -141,12 +149,10 @@ class PpgSignalProcessor(
         
         if (value > lastValue) {
             isRising = true
-        } else if (isRising && lastValue > 0.0005f) { // Umbral de prominencia dinámico/estricto
-            // Pico detectado
+        } else if (isRising && lastValue > 0.0005f) { 
             if (lastPeakTime != 0L) {
                 val rrInterval = timeMillis - lastPeakTime
                 
-                // Validación fisiológica (40-200 BPM)
                 if (rrInterval in 300..1500) {
                     val currentBpm = 60000f / rrInterval
                     bpmBuffer.push(currentBpm)
@@ -174,6 +180,7 @@ class PpgSignalProcessor(
         spo2Buffer.clear()
         sumRedAcSq = 0f
         sumBlueAcSq = 0f
+        sumGreenAcSq = 0f
         rmsCount = 0
     }
 }
