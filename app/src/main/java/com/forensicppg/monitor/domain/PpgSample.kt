@@ -3,27 +3,58 @@ package com.forensicppg.monitor.domain
 /**
  * Representa una muestra de señal PPG procesada desde un frame de cámara.
  * Sigue el contrato de "Zero Simulación" y trazabilidad forense.
+ * Transformada a clase mutable para evitar asignaciones de memoria (Zero Allocation) a 60fps.
  */
-data class PpgSample(
-    val timestamp: Long,          // Timestamp real del frame (nanos o millis)
-    val effectiveFps: Float,      // FPS real medido en el momento de captura
+class PpgSample {
+    var timestamp: Long = 0L
+    var effectiveFps: Float = 0f
     
-    // Valores robustos de intensidad (no promedios simples si es posible)
-    val rawRed: Float,
-    val rawGreen: Float,
-    val rawBlue: Float,
+    var rawRed: Float = 0f
+    var rawGreen: Float = 0f
+    var rawBlue: Float = 0f
     
-    // Absorbancia relativa (Ley de Beer-Lambert aproximada: -ln(I/I0))
-    val ppgGreenAbsorbance: Float,
-    val ppgRedAbsorbance: Float,
+    var ppgGreenAbsorbance: Float = 0f
+    var ppgRedAbsorbance: Float = 0f
+    var ppgBlueAbsorbance: Float = 0f
     
-    // Métricas de calidad de contacto (Quality Gates)
-    val maskCoverage: Float,      // Porcentaje de ROI que es realmente dedo (0.0 - 1.0)
-    val contactScore: Float,      // Puntuación de contacto óptico estable
-    val clippingHigh: Float,      // Ratio de píxeles saturados (>250)
-    val clippingLow: Float,       // Ratio de píxeles oscuros (<8)
-    val motionOptical: Float,     // Estimación de movimiento intra-frame
+    var maskCoverage: Float = 0f
+    var contactScore: Float = 0f
+    var clippingHigh: Float = 0f
+    var clippingLow: Float = 0f
+    var motionOptical: Float = 0f
     
-    val roiBoundingBox: String? = null, // Representación del ROI usado
-    val rejectReason: String? = null    // Motivo por el cual esta muestra podría ser inválida
-)
+    var roiBoundingBox: String? = null
+    var rejectReason: String? = null
+
+    fun update(
+        timestamp: Long,
+        effectiveFps: Float,
+        rawRed: Float,
+        rawGreen: Float,
+        rawBlue: Float,
+        ppgGreenAbsorbance: Float,
+        ppgRedAbsorbance: Float,
+        ppgBlueAbsorbance: Float,
+        maskCoverage: Float,
+        contactScore: Float,
+        clippingHigh: Float,
+        clippingLow: Float,
+        motionOptical: Float,
+        rejectReason: String?
+    ) {
+        this.timestamp = timestamp
+        this.effectiveFps = effectiveFps
+        this.rawRed = rawRed
+        this.rawGreen = rawGreen
+        this.rawBlue = rawBlue
+        this.ppgGreenAbsorbance = ppgGreenAbsorbance
+        this.ppgRedAbsorbance = ppgRedAbsorbance
+        this.ppgBlueAbsorbance = ppgBlueAbsorbance
+        this.maskCoverage = maskCoverage
+        this.contactScore = contactScore
+        this.clippingHigh = clippingHigh
+        this.clippingLow = clippingLow
+        this.motionOptical = motionOptical
+        this.rejectReason = rejectReason
+    }
+}
